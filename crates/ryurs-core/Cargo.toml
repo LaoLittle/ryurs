@@ -1,0 +1,21 @@
+[package]
+name = "ryurs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ryurs-dynarec.workspace = true
+ryurs-gpu-wgpu.workspace = true
+ryurs-macros.workspace = true
+anyhow.workspace = true
+aes.workspace = true
+ctr.workspace = true
+libc.workspace = true
+lz4_flex.workspace = true
+object.workspace = true
+serde.workspace = true
+tracing.workspace = true
+xts-mode.workspace = true
+image.workspace = true
+page_size.workspace = true

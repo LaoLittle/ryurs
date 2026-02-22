@@ -1,0 +1,6 @@
+target/
+.DS_Store
+.idea
+.venv/
+Cargo.lock
+frames/

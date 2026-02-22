@@ -1,0 +1,16 @@
+[package]
+name = "ryurs-dynarec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+cfg-if.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-native.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+page_size.workspace = true
