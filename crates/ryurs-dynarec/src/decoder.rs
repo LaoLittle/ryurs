@@ -5994,8 +5994,8 @@ fn decode_pair_instruction(opcode: u32) -> Option<DecodedInstruction> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BranchCondition, DecodedInstruction, ExtendType, PairAddressMode, ShiftType,
-        SystemRegister, decode_block,
+        decode_block, BranchCondition, DecodedInstruction, ExtendType, PairAddressMode, ShiftType,
+        SystemRegister,
     };
 
     fn encode_mrs(rt: u8, reg: SystemRegister) -> u32 {

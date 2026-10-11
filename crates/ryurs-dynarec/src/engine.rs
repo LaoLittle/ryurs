@@ -42,13 +42,14 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 ))]
 use std::arch::asm;
 
-use crate::arch::{JitDispatchFrame, execute_compiled_block_with_dispatcher_landing};
+use crate::arch::{execute_compiled_block_with_dispatcher_landing, JitDispatchFrame};
 use crate::decoder::{
-    DecodeError, DecodedBlock, DecodedInstruction, ExtendType, PairAddressMode, ShiftType,
-    SystemRegister, decode_block,
+    decode_block, DecodeError, DecodedBlock, DecodedInstruction, ExtendType, PairAddressMode,
+    ShiftType, SystemRegister,
 };
+use crate::memory::{FaultClass, MemoryAccessKind, MemoryStrategy, PteRegion};
 use crate::runtime::{
-    CpuState, DCZID_EL0_VALUE, ExceptionKind, ExecutionContext, ExitReason, SysRegError,
+    CpuState, ExceptionKind, ExecutionContext, ExitReason, SysRegError, DCZID_EL0_VALUE,
 };
 use crate::translator::{BlockCompiler, CompiledBlock, HostPcMapEntry};
 
@@ -57,6 +58,14 @@ pub trait MemoryInterface {
 
     fn fastmem_region(&mut self) -> Option<FastmemRegion> {
         None
+    }
+
+    fn pte_region(&mut self) -> Option<PteRegion> {
+        None
+    }
+
+    fn classify_guest_access(&mut self, _address: u64, _kind: MemoryAccessKind) -> FaultClass {
+        FaultClass::MemoryFault
     }
 
     fn read_u8(&mut self, _address: u64) -> Option<u8> {
@@ -159,6 +168,19 @@ struct ContextPageRange {
 struct RegisteredContextPage {
     page: *mut u8,
     page_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SignalFaultRecord {
+    fault_address: usize,
+    is_write: bool,
+    kind: FaultClass,
+}
+
+struct ThreadJitStack {
+    base: *mut u8,
+    size: usize,
+    top: *mut u8,
 }
 
 // Raw page pointers refer to process-owned VM mappings and remain valid while registered.
@@ -394,6 +416,8 @@ thread_local! {
     static TLS_ACTIVE_DISPATCH_FRAME: Cell<*mut JitDispatchFrame> = const { Cell::new(std::ptr::null_mut()) };
     static TLS_CONTEXT_PAGE_RANGE: Cell<Option<ContextPageRange>> = const { Cell::new(None) };
     static TLS_THREAD_EXECUTION_CONTEXT_PAGE: RefCell<Option<ThreadExecutionContextPage>> = const { RefCell::new(None) };
+    static TLS_SIGNAL_FAULT_RECORD: Cell<Option<SignalFaultRecord>> = const { Cell::new(None) };
+    static TLS_THREAD_JIT_STACK: RefCell<Option<ThreadJitStack>> = const { RefCell::new(None) };
 }
 
 fn with_thread_execution_context_page<R>(
@@ -415,6 +439,87 @@ fn with_thread_execution_context_page<R>(
     })
 }
 
+fn set_signal_fault_record(record: Option<SignalFaultRecord>) {
+    TLS_SIGNAL_FAULT_RECORD.with(|slot| slot.set(record));
+}
+
+fn take_signal_fault_record() -> Option<SignalFaultRecord> {
+    TLS_SIGNAL_FAULT_RECORD.with(|slot| {
+        let record = slot.get();
+        slot.set(None);
+        record
+    })
+}
+
+impl ThreadJitStack {
+    fn allocate(size: usize) -> Option<Self> {
+        let page_size = page_size::get();
+        let aligned_size = size.div_ceil(page_size) * page_size;
+        let total_size = aligned_size.checked_add(page_size * 2)?;
+
+        #[cfg(unix)]
+        unsafe {
+            let mapping = libc::mmap(
+                std::ptr::null_mut(),
+                total_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            );
+            if mapping == libc::MAP_FAILED {
+                return None;
+            }
+            let base = mapping.cast::<u8>();
+            let usable = base.add(page_size);
+            let top = usable.add(aligned_size);
+            let _ = libc::mprotect(base.cast(), page_size, libc::PROT_NONE);
+            let _ = libc::mprotect(top.cast(), page_size, libc::PROT_NONE);
+            Some(Self {
+                base,
+                size: total_size,
+                top,
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut bytes = vec![0u8; aligned_size].into_boxed_slice();
+            let base = bytes.as_mut_ptr();
+            let top = unsafe { base.add(aligned_size) };
+            std::mem::forget(bytes);
+            Some(Self {
+                base,
+                size: aligned_size,
+                top,
+            })
+        }
+    }
+
+    fn top(&self) -> *mut u8 {
+        self.top
+    }
+}
+
+impl Drop for ThreadJitStack {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            let _ = libc::munmap(self.base.cast(), self.size);
+        }
+    }
+}
+
+fn with_thread_jit_stack<R>(f: impl FnOnce(&ThreadJitStack) -> R) -> Option<R> {
+    TLS_THREAD_JIT_STACK.with(|slot| {
+        let mut stack = slot.borrow_mut();
+        if stack.is_none() {
+            *stack = Some(ThreadJitStack::allocate(1024 * 1024)?);
+        }
+        Some(f(stack.as_ref().expect("jit stack should be initialized")))
+    })
+}
+
 #[cfg(any(
     all(target_os = "macos", target_arch = "aarch64"),
     all(
@@ -433,6 +538,30 @@ fn fault_hits_thread_context_page(fault_address: usize) -> bool {
         };
 
         fault_address >= range.start && fault_address < range.end
+    })
+}
+
+#[cfg(any(
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(
+        target_os = "linux",
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )
+    )
+))]
+fn disarm_current_context_page() -> bool {
+    TLS_CONTEXT_PAGE_RANGE.with(|slot| {
+        let Some(range) = slot.get() else {
+            return false;
+        };
+        set_context_page_protection(
+            range.start as *mut u8,
+            range.end.saturating_sub(range.start),
+            ContextPageProtection::ReadWrite,
+        )
     })
 }
 
@@ -595,6 +724,29 @@ pub unsafe fn return_to_dispatcher_from_signal(fault_pc_hint: Option<u64>) -> bo
     frame.landing_pc != 0 && frame.landing_sp != 0
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn read_macos_fault_is_write(ucontext: *mut libc::c_void) -> Option<bool> {
+    let uc = unsafe { (ucontext as *mut DarwinUContext64).as_ref() }?;
+    let mcontext = unsafe { uc.uc_mcontext.as_ref() }?;
+    Some((mcontext.__es.__esr & 0x40) != 0)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+unsafe fn read_macos_fault_is_write(_ucontext: *mut libc::c_void) -> Option<bool> {
+    None
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe fn read_linux_fault_is_write(ucontext: *mut libc::c_void) -> Option<bool> {
+    let uc = unsafe { (ucontext as *mut libc::ucontext_t).as_ref() }?;
+    Some((uc.uc_mcontext.gregs[libc::REG_ERR as usize] & 2) != 0)
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+unsafe fn read_linux_fault_is_write(_ucontext: *mut libc::c_void) -> Option<bool> {
+    None
+}
+
 struct HostStackScope {
     previous_snapshot: usize,
     previous_active: bool,
@@ -734,8 +886,19 @@ extern "C" fn jit_fault_signal_handler_macos(
     let Some(fault_address) = (unsafe { read_fault_address(info) }) else {
         fatal_signal_exit(signum);
     };
-    if !fault_hits_thread_context_page(fault_address) {
-        fatal_signal_exit(signum);
+    if fault_hits_thread_context_page(fault_address) {
+        let _ = disarm_current_context_page();
+        set_signal_fault_record(Some(SignalFaultRecord {
+            fault_address,
+            is_write: unsafe { read_macos_fault_is_write(ucontext) }.unwrap_or(false),
+            kind: FaultClass::Polling,
+        }));
+    } else {
+        set_signal_fault_record(Some(SignalFaultRecord {
+            fault_address,
+            is_write: unsafe { read_macos_fault_is_write(ucontext) }.unwrap_or(false),
+            kind: FaultClass::MemoryFault,
+        }));
     }
 
     let fault_guest_pc_hint =
@@ -872,8 +1035,19 @@ extern "C" fn jit_fault_signal_handler_linux(
     let Some(fault_address) = (unsafe { read_fault_address(info) }) else {
         fatal_signal_exit(signum);
     };
-    if !fault_hits_thread_context_page(fault_address) {
-        fatal_signal_exit(signum);
+    if fault_hits_thread_context_page(fault_address) {
+        let _ = disarm_current_context_page();
+        set_signal_fault_record(Some(SignalFaultRecord {
+            fault_address,
+            is_write: unsafe { read_linux_fault_is_write(ucontext) }.unwrap_or(false),
+            kind: FaultClass::Polling,
+        }));
+    } else {
+        set_signal_fault_record(Some(SignalFaultRecord {
+            fault_address,
+            is_write: unsafe { read_linux_fault_is_write(ucontext) }.unwrap_or(false),
+            kind: FaultClass::MemoryFault,
+        }));
     }
 
     let fault_guest_pc_hint =
@@ -960,6 +1134,66 @@ struct ThreadMemoryFns {
 }
 
 struct ThreadMemoryBinding;
+
+fn classify_bound_signal_fault<M>(
+    memory: &mut M,
+    fastmem_region: Option<FastmemRegion>,
+    record: SignalFaultRecord,
+) -> FaultClass
+where
+    M: MemoryInterface,
+{
+    match record.kind {
+        FaultClass::Polling => FaultClass::Polling,
+        FaultClass::GranularityMismatch => FaultClass::GranularityMismatch,
+        FaultClass::HostFault => FaultClass::HostFault,
+        FaultClass::MemoryFault => {
+            let Some(region) = fastmem_region else {
+                return FaultClass::MemoryFault;
+            };
+            let start = region.host_ptr as usize;
+            let end = start.saturating_add(region.size as usize);
+            if record.fault_address < start || record.fault_address >= end {
+                return FaultClass::HostFault;
+            }
+            let guest_address = region.guest_base + (record.fault_address - start) as u64;
+            memory.classify_guest_access(
+                guest_address,
+                if record.is_write {
+                    MemoryAccessKind::Write
+                } else {
+                    MemoryAccessKind::Read
+                },
+            )
+        }
+    }
+}
+
+fn preferred_memory_strategy<M>(memory: &mut M) -> MemoryStrategy
+where
+    M: MemoryInterface,
+{
+    if memory.fastmem_region().is_some() {
+        MemoryStrategy::Fastmem
+    } else if memory.pte_region().is_some() {
+        MemoryStrategy::PteChecked
+    } else {
+        MemoryStrategy::Memhelper
+    }
+}
+
+fn downgraded_memory_strategy<M>(memory: &mut M, strategy: MemoryStrategy) -> MemoryStrategy
+where
+    M: MemoryInterface,
+{
+    match strategy {
+        MemoryStrategy::Fastmem if memory.pte_region().is_some() => MemoryStrategy::PteChecked,
+        MemoryStrategy::Fastmem => MemoryStrategy::Memhelper,
+        MemoryStrategy::PteChecked => MemoryStrategy::Memhelper,
+        MemoryStrategy::Memhelper => MemoryStrategy::Interpret,
+        MemoryStrategy::Interpret => MemoryStrategy::Interpret,
+    }
+}
 
 impl ThreadMemoryBinding {
     fn bind<M>(memory: &mut M) -> Self
@@ -1218,6 +1452,7 @@ fn compile_with_thread_local(
     arena: &Arc<crate::jit_arena::JitArena>,
     block: &DecodedBlock,
     eager_direct_targets: EagerDirectTargets,
+    strategy: MemoryStrategy,
 ) -> Result<CompiledBlock> {
     TLS_COMPILER.with(|slot| {
         let mut compiler_ptr = slot.get();
@@ -1232,7 +1467,7 @@ fn compile_with_thread_local(
             compiler_ptr
                 .as_mut()
                 .expect("thread-local compiler must be initialized")
-                .compile(block, eager_direct_targets)
+                .compile(block, eager_direct_targets, strategy)
         }
     })
 }
@@ -1628,6 +1863,7 @@ pub extern "C" fn ryurs_jit_exclusive_store_u64(
 
 impl DynarecEngine {
     pub fn new(options: DynarecOptions) -> Result<Self> {
+        install_fault_handler()?;
         let arena = Arc::new(
             crate::jit_arena::JitArena::new()
                 .map_err(|e| anyhow::anyhow!("failed to create JIT arena: {e}"))?,
@@ -1864,11 +2100,16 @@ impl DynarecEngine {
         }
 
         let eager_direct_targets = self.eager_direct_link_hints(&decoded_block);
-        let compiled =
-            match compile_with_thread_local(&self.arena, &decoded_block, eager_direct_targets) {
-                Ok(compiled) => compiled,
-                Err(_) => return false,
-            };
+        let strategy = preferred_memory_strategy(memory);
+        let compiled = match compile_with_thread_local(
+            &self.arena,
+            &decoded_block,
+            eager_direct_targets,
+            strategy,
+        ) {
+            Ok(compiled) => compiled,
+            Err(_) => return false,
+        };
         Self::initialize_eager_return_links(&compiled, eager_direct_targets);
 
         let mut cache = self
@@ -1885,6 +2126,12 @@ impl DynarecEngine {
     where
         M: MemoryInterface,
     {
+        // PTE-backed memory is still correctness-first. Avoid compiling and patching
+        // late-link edges on that path until the direct-edge strategy is stable.
+        if memory.pte_region().is_some() {
+            return;
+        }
+
         if self.patch_block_return_edge(source_pc, next_pc, next_pc) {
             return;
         }
@@ -1954,8 +2201,13 @@ impl DynarecEngine {
                 Arc::new(CachedBlock::Interpreted(decoded_block))
             } else {
                 let eager_direct_targets = self.eager_direct_link_hints(&decoded_block);
-                let compiled =
-                    compile_with_thread_local(&self.arena, &decoded_block, eager_direct_targets)?;
+                let initial_strategy = preferred_memory_strategy(memory);
+                let compiled = compile_with_thread_local(
+                    &self.arena,
+                    &decoded_block,
+                    eager_direct_targets,
+                    initial_strategy,
+                )?;
                 Self::initialize_eager_return_links(&compiled, eager_direct_targets);
                 Arc::new(CachedBlock::Compiled(compiled))
             };
@@ -1976,10 +2228,20 @@ impl DynarecEngine {
         } else {
             state.clear_fastmem_region();
         }
+        if let Some(region) = memory.pte_region() {
+            state.set_pte_region(
+                region.guest_base,
+                region.page_count,
+                region.pte_ptr.cast::<u64>(),
+            );
+        } else {
+            state.clear_pte_region();
+        }
 
         match cached_block.as_ref() {
             CachedBlock::Compiled(block) => {
                 let _binding = ThreadMemoryBinding::bind(memory);
+                set_signal_fault_record(None);
                 let (host_pc_map_ptr, host_pc_map_len) = if block.host_pc_map.is_empty() {
                     (
                         std::ptr::NonNull::<HostPcMapEntry>::dangling().as_ptr()
@@ -1994,7 +2256,6 @@ impl DynarecEngine {
                 let mut fell_back_to_interpreter = false;
 
                 let Some(()) = with_thread_execution_context_page(|execution_page| {
-                    let _ = execution_page.disarm();
                     let execution_context_ptr = execution_page.execution_context_ptr();
                     let execution_context = execution_page.alias_context_mut();
                     execution_context.context = execution_state.clone();
@@ -2012,11 +2273,14 @@ impl DynarecEngine {
                         host_pc_map_len,
                     );
                     let _host_stack_scope = HostStackScope::enter(&mut dispatch_frame);
+                    let jit_stack_top = with_thread_jit_stack(|stack| stack.top())
+                        .expect("jit stack should be available");
                     let next_pc = unsafe {
                         execute_compiled_block_with_dispatcher_landing(
                             block.entry,
                             execution_context_ptr,
                             execution_context.context.fastmem_guest_base,
+                            jit_stack_top,
                             &mut dispatch_frame,
                         )
                     };
@@ -2044,7 +2308,56 @@ impl DynarecEngine {
                     });
                 };
 
-                if matches!(execution_state.exit_reason(), ExitReason::MemoryFault) {
+                if let Some(record) = take_signal_fault_record() {
+                    execution_state.pc = execution_state.pc.max(start_pc);
+                    let fastmem_region = memory.fastmem_region();
+                    match classify_bound_signal_fault(memory, fastmem_region, record) {
+                        FaultClass::Polling => execution_state.set_dispatcher_interrupt(),
+                        FaultClass::GranularityMismatch => execution_state.set_granularity_fault(),
+                        FaultClass::MemoryFault | FaultClass::HostFault => {
+                            execution_state.set_memory_fault()
+                        }
+                    }
+                }
+
+                if matches!(execution_state.exit_reason(), ExitReason::GranularityFault)
+                    && block.strategy == MemoryStrategy::Fastmem
+                {
+                    let fallback_pc = execution_state.pc;
+                    let fallback_strategy = downgraded_memory_strategy(memory, block.strategy);
+                    self.block_cache
+                        .write()
+                        .expect("dynarec block cache poisoned")
+                        .remove(&start_pc);
+                    let decoded_block = match decode_guest_block(
+                        fallback_pc,
+                        self.options.block_max_instructions,
+                        memory,
+                    ) {
+                        Ok(block) => block,
+                        Err(err) => {
+                            mark_decode_error(&mut execution_state, err);
+                            let reason = execution_state.exit_reason();
+                            *state = execution_state;
+                            return Ok(StepResult::Trap {
+                                pc: fallback_pc,
+                                reason,
+                            });
+                        }
+                    };
+                    let eager_direct_targets = self.eager_direct_link_hints(&decoded_block);
+                    let recompiled = compile_with_thread_local(
+                        &self.arena,
+                        &decoded_block,
+                        eager_direct_targets,
+                        fallback_strategy,
+                    )?;
+                    Self::initialize_eager_return_links(&recompiled, eager_direct_targets);
+                    self.block_cache
+                        .write()
+                        .expect("dynarec block cache poisoned")
+                        .insert(fallback_pc, Arc::new(CachedBlock::Compiled(recompiled)));
+                } else if matches!(execution_state.exit_reason(), ExitReason::MemoryFault) {
                     fell_back_to_interpreter = true;
                     let fallback_pc = execution_state.pc;
 
@@ -8169,7 +8482,11 @@ fn execute_ushl_vector(state: &mut CpuState, vd: u8, vn: u8, vm: u8, q: bool, si
             }
         } else {
             let a = (-(amt as i32)) as u32;
-            if a >= lane_bits { 0u128 } else { val >> a }
+            if a >= lane_bits {
+                0u128
+            } else {
+                val >> a
+            }
         };
         result |= shifted << shift;
     }
@@ -8241,7 +8558,7 @@ fn execute_rev64_vector(state: &mut CpuState, vd: u8, vn: u8, q: bool, size: u8)
 
     let mut result = [0u8; 16];
     let elem_size = 1usize << size; // 1, 2, or 4 bytes per element
-    // For each 8-byte group, reverse elements within it
+                                    // For each 8-byte group, reverse elements within it
     for group_start in (0..byte_count).step_by(8) {
         let elems_per_group = 8 / elem_size;
         for i in 0..elems_per_group {
@@ -9492,7 +9809,11 @@ fn execute_fcvt_round_from_float(
             if (fp_val - fp_val.floor()).abs() == 0.5 {
                 let fl = fp_val.floor();
                 let ce = fp_val.ceil();
-                if (fl as i64) % 2 == 0 { fl } else { ce }
+                if (fl as i64) % 2 == 0 {
+                    fl
+                } else {
+                    ce
+                }
             } else {
                 r
             }
@@ -9587,7 +9908,11 @@ fn execute_simd_narrow(
     let read_wide = |lo: u64, hi: u64, idx: u32| -> u64 {
         let shift = idx * wide_bits;
         if wide_bits == 64 {
-            if idx == 0 { lo } else { hi }
+            if idx == 0 {
+                lo
+            } else {
+                hi
+            }
         } else if shift < 64 {
             (lo >> shift) & ((1u64 << wide_bits) - 1)
         } else {
@@ -9913,9 +10238,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        CachedBlock, DynarecEngine, DynarecOptions, FastmemRegion, MemoryInterface, StepResult,
+        classify_bound_signal_fault, return_to_dispatcher_from_signal, CachedBlock, DynarecEngine,
+        DynarecOptions, FastmemRegion, MemoryInterface, SignalFaultRecord, StepResult,
+        TLS_ACTIVE_DISPATCH_FRAME,
     };
     use crate::decoder::SystemRegister;
+    use crate::memory::{rw_flags, FaultClass, MemoryAccessKind, PteRegion, PteTable};
     use crate::runtime::{CpuState, ExceptionKind, ExceptionLevel, ExitReason};
 
     const BASE: u64 = 0x8000_0000;
@@ -10018,6 +10346,106 @@ mod tests {
 
         fn read_u64(&mut self, _address: u64) -> Option<u64> {
             None
+        }
+    }
+
+    struct ClassifyingMemory {
+        inst: HashMap<u64, u32>,
+        guest_base: u64,
+        bytes: Vec<u8>,
+        pte_table: PteTable,
+    }
+
+    impl ClassifyingMemory {
+        fn new(guest_base: u64, size: usize) -> Self {
+            let pte_table = PteTable::new(guest_base, size as u64);
+            Self {
+                inst: HashMap::new(),
+                guest_base,
+                bytes: vec![0; size],
+                pte_table,
+            }
+        }
+
+        fn allow_rw(&mut self) {
+            let _ = self.pte_table.map_range(
+                self.guest_base,
+                self.bytes.as_mut_ptr(),
+                self.bytes.len() as u64,
+                rw_flags(),
+            );
+        }
+
+        fn fault_record(&mut self, guest_offset: usize, is_write: bool) -> SignalFaultRecord {
+            let fastmem = self.fastmem_region().expect("fastmem region should exist");
+            SignalFaultRecord {
+                fault_address: fastmem.host_ptr as usize + guest_offset,
+                is_write,
+                kind: FaultClass::MemoryFault,
+            }
+        }
+    }
+
+    struct PteOnlyMemory {
+        inst: HashMap<u64, u32>,
+        guest_base: u64,
+        bytes: Vec<u8>,
+        pte_table: PteTable,
+    }
+
+    impl PteOnlyMemory {
+        fn new(guest_base: u64, size: usize) -> Self {
+            let mut bytes = vec![0; size];
+            let pte_table = PteTable::new(guest_base, size as u64);
+            let _ = pte_table.map_range(guest_base, bytes.as_mut_ptr(), size as u64, rw_flags());
+            Self {
+                inst: HashMap::new(),
+                guest_base,
+                bytes,
+                pte_table,
+            }
+        }
+    }
+
+    impl MemoryInterface for PteOnlyMemory {
+        fn fetch_u32(&mut self, address: u64) -> Option<u32> {
+            self.inst.get(&address).copied()
+        }
+
+        fn pte_region(&mut self) -> Option<PteRegion> {
+            Some(self.pte_table.region())
+        }
+
+        fn classify_guest_access(&mut self, address: u64, kind: MemoryAccessKind) -> FaultClass {
+            self.pte_table.region().classify_access(address, kind)
+        }
+
+        fn read_u64(&mut self, address: u64) -> Option<u64> {
+            let offset = address.checked_sub(self.guest_base)? as usize;
+            let bytes = self.bytes.get(offset..offset + 8)?;
+            Some(u64::from_le_bytes(bytes.try_into().ok()?))
+        }
+    }
+
+    impl MemoryInterface for ClassifyingMemory {
+        fn fetch_u32(&mut self, address: u64) -> Option<u32> {
+            self.inst.get(&address).copied()
+        }
+
+        fn fastmem_region(&mut self) -> Option<FastmemRegion> {
+            Some(FastmemRegion {
+                guest_base: self.guest_base,
+                host_ptr: self.bytes.as_mut_ptr(),
+                size: self.bytes.len() as u64,
+            })
+        }
+
+        fn pte_region(&mut self) -> Option<PteRegion> {
+            Some(self.pte_table.region())
+        }
+
+        fn classify_guest_access(&mut self, address: u64, kind: MemoryAccessKind) -> FaultClass {
+            self.pte_table.region().classify_access(address, kind)
         }
     }
 
@@ -10418,6 +10846,54 @@ mod tests {
         assert!(
             block2_has_block3,
             "expected block2->block3 direct edge link"
+        );
+    }
+
+    #[test]
+    fn late_linking_skips_pte_backed_targets() {
+        let words = [
+            0x1400_0002, // b +8
+            0xd503_201f, // nop
+            0xf940_0020, // ldr x0, [x1]
+            0xd420_0020, // brk #1
+        ];
+
+        let engine = DynarecEngine::new(DynarecOptions {
+            force_interpreter: false,
+            block_max_instructions: 16,
+        })
+        .expect("dynarec engine should initialize");
+
+        let mut memory = PteOnlyMemory::new(BASE, 0x1000);
+        for (index, word) in words.into_iter().enumerate() {
+            memory.inst.insert(BASE + (index as u64) * 4, word);
+        }
+
+        let data_address = BASE + 0x100;
+        memory.bytes[0x100..0x108].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+
+        let mut state = CpuState::default();
+        state.pc = BASE;
+        state.write_x(1, data_address);
+
+        let result = engine
+            .step_with_memory(&mut state, &mut memory)
+            .expect("late-link source step should succeed");
+        assert!(matches!(
+            result,
+            StepResult::Advanced {
+                start_pc: BASE,
+                end_pc: pc
+            } if pc == BASE + 8
+        ));
+
+        let cache = engine
+            .block_cache
+            .read()
+            .expect("dynarec block cache poisoned");
+        assert!(
+            !cache.contains_key(&(BASE + 8)),
+            "pte-backed memory should not late-link compile the target block"
         );
     }
 
@@ -14042,5 +14518,47 @@ mod tests {
         // Each 16-bit sum's high byte: [0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]
         // Q=0 → result in lower 64 bits, upper zeroed
         assert_eq!(state.read_v128(0), (0x0908_0706_0504_0302, 0));
+    }
+
+    #[test]
+    fn signal_return_marks_dispatcher_interrupt() {
+        let mut state = CpuState::default();
+        let mut frame =
+            crate::arch::JitDispatchFrame::new(&mut state, BASE, 0, 0, std::ptr::null(), 0);
+        frame.landing_pc = 1;
+        frame.landing_sp = 2;
+
+        TLS_ACTIVE_DISPATCH_FRAME.with(|slot| slot.set((&mut frame) as *mut _));
+        let redirected = unsafe { return_to_dispatcher_from_signal(Some(BASE + 4)) };
+        TLS_ACTIVE_DISPATCH_FRAME.with(|slot| slot.set(std::ptr::null_mut()));
+
+        assert!(redirected);
+        assert_eq!(state.pc, BASE + 4);
+        assert_eq!(state.exit_reason(), ExitReason::DispatcherInterrupt);
+    }
+
+    #[test]
+    fn signal_fault_classifies_true_memory_fault() {
+        let mut memory = ClassifyingMemory::new(0x9000_0000, 0x1000);
+        let record = memory.fault_record(0x80, false);
+        let fastmem_region = memory.fastmem_region();
+
+        assert_eq!(
+            classify_bound_signal_fault(&mut memory, fastmem_region, record),
+            FaultClass::MemoryFault
+        );
+    }
+
+    #[test]
+    fn signal_fault_classifies_granularity_mismatch() {
+        let mut memory = ClassifyingMemory::new(0x9100_0000, 0x1000);
+        memory.allow_rw();
+        let record = memory.fault_record(0x40, false);
+        let fastmem_region = memory.fastmem_region();
+
+        assert_eq!(
+            classify_bound_signal_fault(&mut memory, fastmem_region, record),
+            FaultClass::GranularityMismatch
+        );
     }
 }

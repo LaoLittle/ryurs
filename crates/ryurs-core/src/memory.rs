@@ -1,11 +1,14 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
+use ryurs_dynarec::memory::{
+    FaultClass, MemoryAccessKind, PteRegion, PteTable, PTE_FLAG_READ, PTE_FLAG_WRITE,
+};
 use ryurs_dynarec::{FastmemRegion, MemoryInterface};
 use std::collections::HashMap;
 #[cfg(windows)]
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
 
 const LOW_PAGE_SIZE: usize = 0x1000;
@@ -189,14 +192,7 @@ fn set_host_page_protection(
         HostPageProtection::ReadWrite => PAGE_READWRITE,
     };
     // SAFETY: caller provides a valid page pointer and a writable output slot.
-    unsafe {
-        VirtualProtect(
-            page.cast(),
-            page_size,
-            new_protect,
-            &mut previous_protect,
-        ) != 0
-    }
+    unsafe { VirtualProtect(page.cast(), page_size, new_protect, &mut previous_protect) != 0 }
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -366,6 +362,7 @@ pub struct GuestMemory {
     base: u64,
     size: usize,
     reservation: HostReservation,
+    pte_table: PteTable,
     maps: RwLock<MemoryMaps>,
     last_fault_address: AtomicU64,
     host_page_size: usize,
@@ -397,15 +394,43 @@ impl Clone for GuestMemory {
             .expect("guest memory maps lock poisoned")
             .clone();
 
-        Self {
+        let cloned = Self {
             base: self.base,
             size: self.size,
             reservation,
+            pte_table: PteTable::new(self.base, self.reservation.guest_span_size as u64),
             maps: RwLock::new(maps),
             last_fault_address: AtomicU64::new(self.last_fault_address.load(Ordering::Relaxed)),
             host_page_size: self.host_page_size,
             alias_mode: self.alias_mode,
+        };
+
+        for region in cloned
+            .maps
+            .read()
+            .expect("guest memory maps lock poisoned")
+            .high_regions
+            .iter()
+            .copied()
+        {
+            let host_offset = region.start.saturating_sub(cloned.base) as usize;
+            let host_ptr = unsafe { cloned.reservation.guest_base.add(host_offset) };
+            let mut flags = 0u64;
+            if region.permission & 0x1 != 0 {
+                flags |= PTE_FLAG_READ;
+            }
+            if region.permission & 0x2 != 0 {
+                flags |= PTE_FLAG_WRITE;
+            }
+            let _ = cloned.pte_table.map_range(
+                region.start,
+                host_ptr,
+                region.end.saturating_sub(region.start),
+                flags,
+            );
         }
+
+        cloned
     }
 }
 
@@ -424,6 +449,7 @@ impl GuestMemory {
             base,
             size,
             reservation,
+            pte_table: PteTable::new(base, guest_span_size as u64),
             maps: RwLock::new(MemoryMaps::default()),
             last_fault_address: AtomicU64::new(NO_FAULT_ADDRESS),
             host_page_size,
@@ -459,6 +485,7 @@ impl GuestMemory {
         let mut maps = self.maps.write().expect("guest memory maps lock poisoned");
         maps.high_regions.clear();
         maps.high_sparse_pages.clear();
+        self.pte_table.clear();
     }
 
     /// Return all sparse pages (both high and low) as `(page_address, &[u8; 4096])` pairs.
@@ -536,6 +563,17 @@ impl GuestMemory {
             merged.push(region);
         }
         maps.high_regions = merged;
+
+        let host_offset = start.saturating_sub(self.base) as usize;
+        let host_ptr = unsafe { self.reservation.guest_base.add(host_offset) };
+        let mut flags = 0u64;
+        if permission & 0x1 != 0 {
+            flags |= PTE_FLAG_READ;
+        }
+        if permission & 0x2 != 0 {
+            flags |= PTE_FLAG_WRITE;
+        }
+        let _ = self.pte_table.map_range(start, host_ptr, size, flags);
         true
     }
 
@@ -557,6 +595,12 @@ impl GuestMemory {
         let offset = address.checked_sub(self.base)?;
         let offset = usize::try_from(offset).ok()?;
         (offset < self.size).then_some(offset)
+    }
+
+    fn checked_reserved_offset(&self, address: u64) -> Option<usize> {
+        let offset = address.checked_sub(self.base)?;
+        let offset = usize::try_from(offset).ok()?;
+        (offset < self.reservation.guest_span_size).then_some(offset)
     }
 
     fn low_region_contains(
@@ -659,11 +703,17 @@ impl GuestMemory {
             }
 
             let (page, page_offset) = Self::low_page_parts(byte_address);
-            *slot = maps
-                .high_sparse_pages
-                .get(&page)
-                .map(|data| data[page_offset])
-                .unwrap_or(0);
+            if let Some(data) = maps.high_sparse_pages.get(&page) {
+                *slot = data[page_offset];
+                continue;
+            }
+
+            if let Some(offset) = self.checked_reserved_offset(byte_address) {
+                // SAFETY: the offset is in-bounds for the reserved guest span.
+                unsafe {
+                    *slot = *self.reservation.guest_base.add(offset);
+                }
+            }
         }
 
         Some(out)
@@ -692,6 +742,12 @@ impl GuestMemory {
                     *self.reservation.guest_base.add(offset) = value;
                 }
             } else {
+                if let Some(offset) = self.checked_reserved_offset(byte_address) {
+                    // SAFETY: the offset is in-bounds for the reserved guest span.
+                    unsafe {
+                        *self.reservation.guest_base.add(offset) = value;
+                    }
+                }
                 let (page, page_offset) = Self::low_page_parts(byte_address);
                 let page_data = maps
                     .high_sparse_pages
@@ -911,6 +967,14 @@ impl MemoryInterface for GuestMemory {
         Some(GuestMemory::fastmem_region(self))
     }
 
+    fn pte_region(&mut self) -> Option<PteRegion> {
+        Some(self.pte_table.region())
+    }
+
+    fn classify_guest_access(&mut self, address: u64, kind: MemoryAccessKind) -> FaultClass {
+        self.pte_table.region().classify_access(address, kind)
+    }
+
     fn fetch_u32(&mut self, address: u64) -> Option<u32> {
         let value = GuestMemory::fetch_u32(self, address);
         if value.is_none() {
@@ -1122,6 +1186,18 @@ impl MemoryInterface for LockedSharedMemoryView {
         Some(self.memory.inner.fastmem_region())
     }
 
+    fn pte_region(&mut self) -> Option<PteRegion> {
+        Some(self.memory.inner.pte_table.region())
+    }
+
+    fn classify_guest_access(&mut self, address: u64, kind: MemoryAccessKind) -> FaultClass {
+        self.memory
+            .inner
+            .pte_table
+            .region()
+            .classify_access(address, kind)
+    }
+
     fn fetch_u32(&mut self, address: u64) -> Option<u32> {
         let value = self.memory.inner.fetch_u32(address);
         if value.is_none() {
@@ -1197,6 +1273,8 @@ impl MemoryInterface for LockedSharedMemoryView {
 
 #[cfg(test)]
 mod tests {
+    use ryurs_dynarec::memory::decode_host_pointer;
+
     use super::{GuestMemory, MEMORY_PERMISSION_READ_WRITE, MEMORY_STATE_HEAP};
 
     #[test]
@@ -1269,5 +1347,35 @@ mod tests {
 
         let cloned = memory.clone();
         assert_eq!(cloned.read_u32(address), Some(0x1122_3344));
+    }
+
+    #[test]
+    fn pte_backed_high_pages_share_storage_with_core_accessors() {
+        let memory = GuestMemory::new(0x8000_0000, 0x10_0000);
+        memory.clear_high_regions();
+
+        let address = 0xba60_0000;
+        assert!(memory.map_high_region(
+            0x8000_0000,
+            0xc000_0000,
+            MEMORY_STATE_HEAP,
+            MEMORY_PERMISSION_READ_WRITE,
+        ));
+
+        let pte = memory
+            .pte_table
+            .region()
+            .load_pte(address)
+            .expect("mapped high page should have a PTE entry");
+        let host_ptr = decode_host_pointer(pte, address).cast::<u32>();
+
+        unsafe {
+            host_ptr.write(0x1122_3344);
+        }
+        assert_eq!(memory.read_u32(address), Some(0x1122_3344));
+
+        assert!(memory.write_u32(address, 0x5566_7788));
+        let mirrored = unsafe { host_ptr.read() };
+        assert_eq!(mirrored, 0x5566_7788);
     }
 }

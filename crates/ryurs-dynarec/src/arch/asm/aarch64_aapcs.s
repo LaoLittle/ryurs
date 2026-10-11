@@ -2,6 +2,9 @@
 .globl _RNvNtNtC13ryurs_dynarec4arch3asm13execute_block
 __RNvNtNtC13ryurs_dynarec4arch3asm13execute_block:
 _RNvNtNtC13ryurs_dynarec4arch3asm13execute_block:
+    mov x9, sp
+    str x9, [x4, #{host_sp_off}]
+    mov sp, x3
     sub sp, sp, #224
 
     stp x19, x20, [sp, #0]
@@ -17,12 +20,13 @@ _RNvNtNtC13ryurs_dynarec4arch3asm13execute_block:
     stp q14, q15, [sp, #192]
 
     mov x10, sp
-    str x10, [x3, #{landing_sp_off}]
+    str x10, [x4, #{landing_sp_off}]
     adr x9, 2f
-    str x9, [x3, #{landing_pc_off}]
+    str x9, [x4, #{landing_pc_off}]
     str x9, [x1, #{return_addr_off}]
 
     mov x19, x1
+    mov x20, x4
     mov x11, x0
     adr x10, 1f
     mov x30, x10
@@ -43,6 +47,7 @@ __RNvNtNtC13ryurs_dynarec4arch3asm14landing_target:
 _RNvNtNtC13ryurs_dynarec4arch3asm14landing_target:
 2:
     ldr x0, [x19, #{context_pc_off}]
+    ldr x9, [x20, #{host_sp_off}]
     ldp q8, q9, [sp, #96]
     ldp q10, q11, [sp, #128]
     ldp q12, q13, [sp, #160]
@@ -56,4 +61,5 @@ _RNvNtNtC13ryurs_dynarec4arch3asm14landing_target:
     ldp x29, x30, [sp, #80]
 
     add sp, sp, #224
+    mov sp, x9
     ret

@@ -52,6 +52,7 @@ pub enum ExitReason {
     Breakpoint(u16),
     DecodeFault,
     MemoryFault,
+    GranularityFault,
     PrivilegeFault,
     SupervisorCall(u16),
     UnknownSupervisorCall(u16),
@@ -75,6 +76,11 @@ pub enum ExceptionError {
 pub const CPUSTATE_FASTMEM_SIZE_OFFSET: i32 = std::mem::offset_of!(CpuState, fastmem_size) as i32;
 pub const CPUSTATE_FASTMEM_HOST_PTR_OFFSET: i32 =
     std::mem::offset_of!(CpuState, fastmem_host_ptr) as i32;
+pub const CPUSTATE_PTE_PTR_OFFSET: i32 = std::mem::offset_of!(CpuState, pte_ptr) as i32;
+pub const CPUSTATE_PTE_PAGE_COUNT_OFFSET: i32 =
+    std::mem::offset_of!(CpuState, pte_page_count) as i32;
+pub const CPUSTATE_PTE_GUEST_BASE_OFFSET: i32 =
+    std::mem::offset_of!(CpuState, pte_guest_base) as i32;
 pub const CPUSTATE_EXCLUSIVE_VALID_OFFSET: i32 =
     std::mem::offset_of!(CpuState, exclusive_valid) as i32;
 pub const CPUSTATE_EXCLUSIVE_SIZE_OFFSET: i32 =
@@ -109,6 +115,10 @@ pub struct CpuState {
     pub fastmem_guest_base: u64,
     pub fastmem_size: u64,
     pub fastmem_host_ptr: u64,
+
+    pub pte_guest_base: u64,
+    pub pte_page_count: u64,
+    pub pte_ptr: u64,
 
     pub sp_el0: u64,
     pub sp_el1: u64,
@@ -179,6 +189,10 @@ impl Default for CpuState {
             fastmem_size: 0,
             fastmem_host_ptr: 0,
 
+            pte_guest_base: 0,
+            pte_page_count: 0,
+            pte_ptr: 0,
+
             sp_el0: 0,
             sp_el1: 0,
             sp_el2: 0,
@@ -206,7 +220,11 @@ impl Default for CpuState {
 
 impl CpuState {
     pub fn read_x(&self, reg: u8) -> u64 {
-        if reg >= 31 { 0 } else { self.x[reg as usize] }
+        if reg >= 31 {
+            0
+        } else {
+            self.x[reg as usize]
+        }
     }
 
     pub fn write_x(&mut self, reg: u8, value: u64) {
@@ -273,6 +291,18 @@ impl CpuState {
         self.fastmem_host_ptr = 0;
     }
 
+    pub fn set_pte_region(&mut self, guest_base: u64, page_count: u64, pte_ptr: *const u64) {
+        self.pte_guest_base = guest_base;
+        self.pte_page_count = page_count;
+        self.pte_ptr = pte_ptr as usize as u64;
+    }
+
+    pub fn clear_pte_region(&mut self) {
+        self.pte_guest_base = 0;
+        self.pte_page_count = 0;
+        self.pte_ptr = 0;
+    }
+
     pub fn set_breakpoint(&mut self, imm: u16) {
         self.exit_code = 1;
         self.trap_imm = imm;
@@ -284,6 +314,10 @@ impl CpuState {
 
     pub fn set_memory_fault(&mut self) {
         self.exit_code = 3;
+    }
+
+    pub fn set_granularity_fault(&mut self) {
+        self.exit_code = 10;
     }
 
     pub fn set_dispatcher_interrupt(&mut self) {
@@ -325,6 +359,7 @@ impl CpuState {
             7 => ExitReason::SecureMonitorCall(self.trap_imm),
             8 => ExitReason::ExceptionReturn,
             9 => ExitReason::DispatcherInterrupt,
+            10 => ExitReason::GranularityFault,
             _ => ExitReason::DecodeFault,
         }
     }

@@ -12,3 +12,8 @@
 执行的时候也可以走二级分表查找，目前是一个大的`HashMap<addr, addr>`，先保持可用。
 
 对于Invalidation，我们可以利用现有的Late-linking slot机制，遍历JIT Arena里的Data段（需要按16bytes对齐 `(guest, host)` pair），找到需要invalidate的guest并清空slot。
+
+## Execution Suspension
+
+suspend的时候保存ucontext（rust再写一套跨平台context）到tls，然后修改exit_reason为特殊的值表示这个exit是由polling page引起的中断而不是jit invalidation导致的（后者无需恢复上下文），返回dispatcher后如果查询发现是这个中断就读取host特定的context，并走一个恢复用的专用汇编函数。
+考虑到suspend thread这种调用情况很少，本身也比较重，这种slow path overhead可以接受。

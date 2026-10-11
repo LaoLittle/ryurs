@@ -6,6 +6,7 @@ use std::mem;
 
 const LANDING_PC_OFFSET: usize = mem::offset_of!(JitDispatchFrame, landing_pc);
 const LANDING_SP_OFFSET: usize = mem::offset_of!(JitDispatchFrame, landing_sp);
+const HOST_SP_OFFSET: usize = mem::offset_of!(JitDispatchFrame, host_sp);
 const RETURN_ADDRESS_OFFSET: usize = mem::offset_of!(ExecutionContext, return_address);
 const CONTEXT_PC_OFFSET: usize =
     mem::offset_of!(ExecutionContext, context) + mem::offset_of!(CpuState, pc);
@@ -14,6 +15,7 @@ global_asm!(
     include_str!("asm/aarch64_aapcs.s"),
     landing_pc_off = const LANDING_PC_OFFSET,
     landing_sp_off = const LANDING_SP_OFFSET,
+    host_sp_off = const HOST_SP_OFFSET,
     return_addr_off = const RETURN_ADDRESS_OFFSET,
     context_pc_off = const CONTEXT_PC_OFFSET,
 );
@@ -23,6 +25,7 @@ unsafe extern "C" {
         entry: usize,
         execution_context_ptr: *mut ExecutionContext,
         guest_base: u64,
+        jit_stack_top: *mut u8,
         frame_ptr: *mut JitDispatchFrame,
     ) -> u64;
 
@@ -37,6 +40,7 @@ pub(crate) unsafe fn execute_compiled_block_with_dispatcher_landing(
     entry: BlockEntry,
     execution_context_ptr: *mut ExecutionContext,
     guest_base: u64,
+    jit_stack_top: *mut u8,
     frame_ptr: *mut JitDispatchFrame,
 ) -> u64 {
     // Rust does not currently expose `extern "aapcs"` on all aarch64 targets, but
@@ -46,6 +50,7 @@ pub(crate) unsafe fn execute_compiled_block_with_dispatcher_landing(
             entry as usize,
             execution_context_ptr,
             guest_base,
+            jit_stack_top,
             frame_ptr,
         )
     }

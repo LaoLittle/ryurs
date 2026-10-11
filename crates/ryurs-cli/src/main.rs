@@ -1241,6 +1241,7 @@ fn reason_label(reason: ExitReason) -> String {
         ExitReason::HypervisorCall(imm) => format!("hvc(imm={imm})"),
         ExitReason::SecureMonitorCall(imm) => format!("smc(imm={imm})"),
         ExitReason::ExceptionReturn => "eret".to_string(),
+        ExitReason::GranularityFault => "granularity-fault".to_string(),
     }
 }
 

@@ -6,6 +6,7 @@ use cfg_if::cfg_if;
 pub(crate) struct JitDispatchFrame {
     pub(crate) landing_pc: usize,
     pub(crate) landing_sp: usize,
+    pub(crate) host_sp: usize,
     pub(crate) state_ptr: *mut CpuState,
     pub(crate) block_pc: u64,
     pub(crate) host_code_start: usize,
@@ -26,6 +27,7 @@ impl JitDispatchFrame {
         Self {
             landing_pc: 0,
             landing_sp: 0,
+            host_sp: 0,
             state_ptr,
             block_pc,
             host_code_start,

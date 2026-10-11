@@ -1,12 +1,12 @@
-use anyhow::{Context, Result, anyhow};
-use cranelift_codegen::Context as CodegenContext;
+use anyhow::{anyhow, Context, Result};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
-    AbiParam, BlockArg, ConstantData, InstBuilder, MemFlags, SourceLoc, Value, types,
+    types, AbiParam, BlockArg, ConstantData, InstBuilder, MemFlags, SourceLoc, Value,
 };
 use cranelift_codegen::ir::{AliasRegion, ArgumentPurpose, Endianness, SigRef};
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
+use cranelift_codegen::Context as CodegenContext;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use std::cell::Cell;
 use std::mem;
@@ -17,11 +17,15 @@ use crate::decoder::{
     BranchCondition, DecodedBlock, DecodedInstruction, ExtendType, PairAddressMode, ShiftType,
     SystemRegister,
 };
+use crate::memory::{
+    MemoryStrategy, GUEST_PAGE_BITS, GUEST_PAGE_MASK, PTE_FLAG_READ, PTE_FLAG_SPECIAL,
+    PTE_FLAG_VALID, PTE_FLAG_WRITE,
+};
 use crate::runtime::{
-    CPUSTATE_EXCLUSIVE_ADDRESS_OFFSET, CPUSTATE_EXCLUSIVE_SIZE_OFFSET,
+    CpuState, ExecutionContext, CPUSTATE_EXCLUSIVE_ADDRESS_OFFSET, CPUSTATE_EXCLUSIVE_SIZE_OFFSET,
     CPUSTATE_EXCLUSIVE_VALID_OFFSET, CPUSTATE_FASTMEM_HOST_PTR_OFFSET,
-    CPUSTATE_FASTMEM_SIZE_OFFSET, CPUSTATE_VREG_BASE_OFFSET, CPUSTATE_VREG_STRIDE, CpuState,
-    ExecutionContext,
+    CPUSTATE_FASTMEM_SIZE_OFFSET, CPUSTATE_PTE_GUEST_BASE_OFFSET, CPUSTATE_PTE_PAGE_COUNT_OFFSET,
+    CPUSTATE_PTE_PTR_OFFSET, CPUSTATE_VREG_BASE_OFFSET, CPUSTATE_VREG_STRIDE,
 };
 
 pub type BlockEntry = unsafe extern "C" fn(*mut ExecutionContext, u64) -> u64;
@@ -40,6 +44,7 @@ pub struct CompiledBlock {
     pub code_start: usize,
     pub code_size: u32,
     pub host_pc_map: Arc<[HostPcMapEntry]>,
+    pub strategy: MemoryStrategy,
     return_address_slot: usize,
     return_link_entry_count: usize,
 }
@@ -197,11 +202,13 @@ const EXCLUSIVE_SIZE_OFFSET: i32 = CPUSTATE_EXCLUSIVE_SIZE_OFFSET;
 const EXCLUSIVE_ADDRESS_OFFSET: i32 = CPUSTATE_EXCLUSIVE_ADDRESS_OFFSET;
 const LINK_REGISTER: u8 = 30;
 const EXIT_BREAKPOINT: i64 = 1;
+const EXIT_MEMORY_FAULT: i64 = 3;
 const EXIT_PRIVILEGE_FAULT: i64 = 4;
 const EXIT_SVC: i64 = 5;
 const EXIT_HVC: i64 = 6;
 const EXIT_SMC: i64 = 7;
 const EXIT_ERET: i64 = 8;
+const EXIT_GRANULARITY_FAULT: i64 = 10;
 const RETURN_LINK_ENTRY_STRIDE: i32 = mem::size_of::<ReturnLinkEntry>() as i32;
 const RETURN_LINK_ENTRY_EXPECTED_OFFSET: i32 =
     mem::offset_of!(ReturnLinkEntry, expected_next_pc) as i32;
@@ -262,6 +269,14 @@ struct FastmemStateValues {
 }
 
 #[derive(Clone, Copy)]
+struct PteStateValues {
+    pointer_ty: cranelift_codegen::ir::Type,
+    guest_base: Value,
+    page_count: Value,
+    pte_ptr_u64: Value,
+}
+
+#[derive(Clone, Copy)]
 enum PendingNzcvRecipe {
     Values {
         n: Value,
@@ -319,7 +334,9 @@ enum FastmemAccessWidth {
 thread_local! {
     static TLS_FASTMEM_HELPERS: Cell<Option<FastmemHelperRefs>> = const { Cell::new(None) };
     static TLS_FASTMEM_STATE: Cell<Option<FastmemStateValues>> = const { Cell::new(None) };
+    static TLS_PTE_STATE: Cell<Option<PteStateValues>> = const { Cell::new(None) };
     static TLS_PENDING_NZCV: Cell<Option<PendingNzcvRecipe>> = const { Cell::new(None) };
+    static TLS_MEMORY_STRATEGY: Cell<MemoryStrategy> = const { Cell::new(MemoryStrategy::Fastmem) };
     #[cfg(any(
         target_arch = "x86_64",
         target_arch = "aarch64",
@@ -339,6 +356,7 @@ thread_local! {
     ))]
     static TLS_RETURN_LINK_LAYOUT: Cell<Option<ReturnLinkLayout>> = const { Cell::new(None) };
     static TLS_CURRENT_GUEST_PC: Cell<Option<u64>> = const { Cell::new(None) };
+    static TLS_ACTIVE_REG_CACHE: Cell<*mut JitRegCache> = const { Cell::new(std::ptr::null_mut()) };
 }
 
 fn set_current_guest_pc(pc: Option<u64>) {
@@ -349,6 +367,10 @@ fn current_guest_srcloc() -> Option<SourceLoc> {
     let guest_pc = TLS_CURRENT_GUEST_PC.with(|slot| slot.get())?;
     let bits = u32::try_from(guest_pc).ok()?;
     Some(SourceLoc::new(bits))
+}
+
+fn current_guest_pc() -> Option<u64> {
+    TLS_CURRENT_GUEST_PC.with(|slot| slot.get())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -501,6 +523,9 @@ fn try_fuse_mov_wide_sequence(
 struct FastmemHelperBinding;
 
 struct FastmemStateBinding;
+struct ActiveRegCacheBinding;
+struct PteStateBinding;
+struct MemoryStrategyBinding;
 
 #[cfg(any(
     target_arch = "x86_64",
@@ -557,6 +582,45 @@ impl FastmemStateBinding {
 impl Drop for FastmemStateBinding {
     fn drop(&mut self) {
         TLS_FASTMEM_STATE.with(|slot| slot.set(None));
+    }
+}
+
+impl ActiveRegCacheBinding {
+    fn bind(reg_cache: &mut JitRegCache) -> Self {
+        TLS_ACTIVE_REG_CACHE.with(|slot| slot.set(reg_cache as *mut JitRegCache));
+        Self
+    }
+}
+
+impl Drop for ActiveRegCacheBinding {
+    fn drop(&mut self) {
+        TLS_ACTIVE_REG_CACHE.with(|slot| slot.set(std::ptr::null_mut()));
+    }
+}
+
+impl PteStateBinding {
+    fn bind(values: PteStateValues) -> Self {
+        TLS_PTE_STATE.with(|slot| slot.set(Some(values)));
+        Self
+    }
+}
+
+impl Drop for PteStateBinding {
+    fn drop(&mut self) {
+        TLS_PTE_STATE.with(|slot| slot.set(None));
+    }
+}
+
+impl MemoryStrategyBinding {
+    fn bind(strategy: MemoryStrategy) -> Self {
+        TLS_MEMORY_STRATEGY.with(|slot| slot.set(strategy));
+        Self
+    }
+}
+
+impl Drop for MemoryStrategyBinding {
+    fn drop(&mut self) {
+        TLS_MEMORY_STRATEGY.with(|slot| slot.set(MemoryStrategy::Fastmem));
     }
 }
 
@@ -631,6 +695,26 @@ impl Drop for ReturnToDispatcherTailSigBinding {
 
 fn current_fastmem_state() -> Option<FastmemStateValues> {
     TLS_FASTMEM_STATE.with(|slot| slot.get())
+}
+
+fn current_pte_state() -> Option<PteStateValues> {
+    TLS_PTE_STATE.with(|slot| slot.get())
+}
+
+fn current_memory_strategy() -> MemoryStrategy {
+    TLS_MEMORY_STRATEGY.with(|slot| slot.get())
+}
+
+fn with_active_reg_cache<R>(f: impl FnOnce(&mut JitRegCache) -> R) -> Option<R> {
+    TLS_ACTIVE_REG_CACHE.with(|slot| {
+        let ptr = slot.get();
+        if ptr.is_null() {
+            None
+        } else {
+            // SAFETY: bound for the current compile invocation only.
+            Some(f(unsafe { &mut *ptr }))
+        }
+    })
 }
 
 fn current_pending_nzcv() -> Option<PendingNzcvRecipe> {
@@ -837,6 +921,7 @@ impl BlockCompiler {
         &mut self,
         block: &DecodedBlock,
         eager_direct_targets: EagerDirectTargets,
+        strategy: MemoryStrategy,
     ) -> Result<CompiledBlock> {
         self.ctx.clear();
         self.ctx.func.signature.call_conv = self.isa.default_call_conv();
@@ -899,6 +984,7 @@ impl BlockCompiler {
         let _return_target_slot_binding = ReturnTargetSlotBinding::bind(return_slot_addr);
         let memory_helpers = self.declare_memory_helpers(pointer_ty)?;
         let _fastmem_helper_binding = FastmemHelperBinding::bind(&memory_helpers);
+        let _memory_strategy_binding = MemoryStrategyBinding::bind(strategy);
         #[cfg(any(
             target_arch = "x86_64",
             target_arch = "aarch64",
@@ -951,14 +1037,39 @@ impl BlockCompiler {
                 state_ptr,
                 FASTMEM_HOST_PTR_OFFSET,
             );
+            let pte_guest_base = builder.ins().load(
+                types::I64,
+                MemFlags::new(),
+                state_ptr,
+                CPUSTATE_PTE_GUEST_BASE_OFFSET,
+            );
+            let pte_page_count = builder.ins().load(
+                types::I64,
+                MemFlags::new(),
+                state_ptr,
+                CPUSTATE_PTE_PAGE_COUNT_OFFSET,
+            );
+            let pte_ptr_u64 = builder.ins().load(
+                types::I64,
+                MemFlags::new(),
+                state_ptr,
+                CPUSTATE_PTE_PTR_OFFSET,
+            );
             let _fastmem_state_binding = FastmemStateBinding::bind(FastmemStateValues {
                 pointer_ty,
                 guest_base: fastmem_guest_base,
                 size: fastmem_size,
                 host_ptr_u64: fastmem_host_ptr_u64,
             });
+            let _pte_state_binding = PteStateBinding::bind(PteStateValues {
+                pointer_ty,
+                guest_base: pte_guest_base,
+                page_count: pte_page_count,
+                pte_ptr_u64,
+            });
 
             let mut reg_cache = JitRegCache::new();
+            let _active_reg_cache_binding = ActiveRegCacheBinding::bind(&mut reg_cache);
             let mut terminated = false;
 
             let mut index = 0usize;
@@ -8878,6 +8989,7 @@ impl BlockCompiler {
             code_start: code_ptr as usize,
             code_size,
             host_pc_map,
+            strategy,
             return_address_slot,
             return_link_entry_count,
         })
@@ -10279,6 +10391,32 @@ fn emit_fault_check(builder: &mut FunctionBuilder, state_ptr: Value, instr_pc: u
     builder.switch_to_block(cont_block);
 }
 
+fn emit_memory_barrier_flush(builder: &mut FunctionBuilder, state_ptr: Value) {
+    emit_flush_pending_nzcv(builder, state_ptr);
+    let _ = with_active_reg_cache(|reg_cache| reg_cache.flush(builder, state_ptr));
+}
+
+fn emit_exit_to_dispatcher(
+    builder: &mut FunctionBuilder,
+    state_ptr: Value,
+    next_pc: Value,
+    exit_code: i64,
+) {
+    let exit_value = builder.ins().iconst(types::I32, exit_code);
+    builder
+        .ins()
+        .store(MemFlags::new(), exit_value, state_ptr, EXIT_CODE_OFFSET);
+    emit_return_to_dispatcher(builder, state_ptr, next_pc);
+}
+
+fn emit_memory_slowpath_return(builder: &mut FunctionBuilder, state_ptr: Value, exit_code: i64) {
+    emit_memory_barrier_flush(builder, state_ptr);
+    let fault_pc = builder
+        .ins()
+        .iconst(types::I64, current_guest_pc().unwrap_or(0) as i64);
+    emit_exit_to_dispatcher(builder, state_ptr, fault_pc, exit_code);
+}
+
 fn vreg_offset(reg: u8) -> i32 {
     CPUSTATE_VREG_BASE_OFFSET + i32::from(reg) * CPUSTATE_VREG_STRIDE
 }
@@ -10418,170 +10556,242 @@ fn emit_call_mem_read(
 ) -> Value {
     enter_trap_srcloc(builder);
 
-    let Some(width) = fastmem_read_width(helper) else {
-        let call = helper.call(builder, &[state_ptr, address]);
-        let result = builder.inst_results(call)[0];
-        leave_trap_srcloc(builder);
-        return result;
-    };
+    match current_memory_strategy() {
+        MemoryStrategy::Fastmem => {
+            let Some(width) = fastmem_read_width(helper) else {
+                let call = helper.call(builder, &[state_ptr, address]);
+                let result = builder.inst_results(call)[0];
+                leave_trap_srcloc(builder);
+                return result;
+            };
+            let Some(fastmem_state) = current_fastmem_state() else {
+                let call = helper.call(builder, &[state_ptr, address]);
+                let result = builder.inst_results(call)[0];
+                leave_trap_srcloc(builder);
+                return result;
+            };
 
-    let Some(fastmem_state) = current_fastmem_state() else {
-        let call = helper.call(builder, &[state_ptr, address]);
-        let result = builder.inst_results(call)[0];
-        leave_trap_srcloc(builder);
-        return result;
-    };
+            emit_memory_barrier_flush(builder, state_ptr);
 
-    let pointer_ty = fastmem_state.pointer_ty;
-    let access_size = fastmem_access_bytes(width);
-    let guest_base = fastmem_state.guest_base;
-    let region_size = fastmem_state.size;
-    let host_ptr_u64 = fastmem_state.host_ptr_u64;
+            let pointer_ty = fastmem_state.pointer_ty;
+            let access_size = fastmem_access_bytes(width);
+            let guest_base = fastmem_state.guest_base;
+            let region_size = fastmem_state.size;
+            let host_ptr_u64 = fastmem_state.host_ptr_u64;
 
-    if unsafe_direct_memory_enabled() {
-        let miss_block = builder.create_block();
-        let direct_block = builder.create_block();
-        let done_block = builder.create_block();
-        builder.append_block_param(done_block, types::I64);
+            let miss_block = builder.create_block();
+            let check_base_block = builder.create_block();
+            let check_wrap_block = builder.create_block();
+            let check_limit_block = builder.create_block();
+            let fastmem_block = builder.create_block();
+            let done_block = builder.create_block();
+            builder.append_block_param(done_block, types::I64);
 
-        let host_ptr_missing = builder.ins().icmp_imm(IntCC::Equal, host_ptr_u64, 0);
-        builder
-            .ins()
-            .brif(host_ptr_missing, miss_block, &[], direct_block, &[]);
-        builder.seal_block(miss_block);
-        builder.seal_block(direct_block);
+            let host_ptr_missing = builder.ins().icmp_imm(IntCC::Equal, host_ptr_u64, 0);
+            builder
+                .ins()
+                .brif(host_ptr_missing, miss_block, &[], check_base_block, &[]);
+            builder.seal_block(check_base_block);
 
-        builder.switch_to_block(direct_block);
-        let offset = builder.ins().isub(address, guest_base);
-        let host_addr_u64 = builder.ins().iadd(host_ptr_u64, offset);
-        let host_addr = if pointer_ty == types::I64 {
-            host_addr_u64
-        } else {
-            builder.ins().ireduce(pointer_ty, host_addr_u64)
-        };
-        let loaded = match width {
-            FastmemAccessWidth::U8 => {
-                let raw = builder.ins().load(types::I8, MemFlags::new(), host_addr, 0);
-                builder.ins().uextend(types::I64, raw)
-            }
-            FastmemAccessWidth::U16 => {
-                let raw = builder
-                    .ins()
-                    .load(types::I16, MemFlags::new(), host_addr, 0);
-                builder.ins().uextend(types::I64, raw)
-            }
-            FastmemAccessWidth::U32 => {
-                let raw = builder
-                    .ins()
-                    .load(types::I32, MemFlags::new(), host_addr, 0);
-                builder.ins().uextend(types::I64, raw)
-            }
-            FastmemAccessWidth::U64 => {
+            builder.switch_to_block(check_base_block);
+            let before_base = builder
+                .ins()
+                .icmp(IntCC::UnsignedLessThan, address, guest_base);
+            builder
+                .ins()
+                .brif(before_base, miss_block, &[], check_wrap_block, &[]);
+            builder.seal_block(check_wrap_block);
+
+            builder.switch_to_block(check_wrap_block);
+            let offset = builder.ins().isub(address, guest_base);
+            let end = builder.ins().iadd_imm(offset, access_size);
+            let wrapped = builder.ins().icmp(IntCC::UnsignedLessThan, end, offset);
+            builder
+                .ins()
+                .brif(wrapped, miss_block, &[], check_limit_block, &[]);
+            builder.seal_block(check_limit_block);
+
+            builder.switch_to_block(check_limit_block);
+            let out_of_range = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, end, region_size);
+            builder
+                .ins()
+                .brif(out_of_range, miss_block, &[], fastmem_block, &[]);
+            builder.seal_block(fastmem_block);
+            builder.seal_block(miss_block);
+
+            builder.switch_to_block(fastmem_block);
+            let host_addr_u64 = builder.ins().iadd(host_ptr_u64, offset);
+            let host_addr = if pointer_ty == types::I64 {
+                host_addr_u64
+            } else {
+                builder.ins().ireduce(pointer_ty, host_addr_u64)
+            };
+            let loaded = match width {
+                FastmemAccessWidth::U8 => {
+                    let raw = builder.ins().load(types::I8, MemFlags::new(), host_addr, 0);
+                    builder.ins().uextend(types::I64, raw)
+                }
+                FastmemAccessWidth::U16 => {
+                    let raw = builder
+                        .ins()
+                        .load(types::I16, MemFlags::new(), host_addr, 0);
+                    builder.ins().uextend(types::I64, raw)
+                }
+                FastmemAccessWidth::U32 => {
+                    let raw = builder
+                        .ins()
+                        .load(types::I32, MemFlags::new(), host_addr, 0);
+                    builder.ins().uextend(types::I64, raw)
+                }
+                FastmemAccessWidth::U64 => {
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), host_addr, 0)
+                }
+            };
+            builder.ins().jump(done_block, &[BlockArg::from(loaded)]);
+
+            builder.switch_to_block(miss_block);
+            emit_memory_slowpath_return(builder, state_ptr, EXIT_MEMORY_FAULT);
+
+            builder.seal_block(done_block);
+            builder.switch_to_block(done_block);
+            let result = builder.block_params(done_block)[0];
+            leave_trap_srcloc(builder);
+            result
+        }
+        MemoryStrategy::PteChecked => {
+            let Some(width) = fastmem_read_width(helper) else {
+                let call = helper.call(builder, &[state_ptr, address]);
+                let result = builder.inst_results(call)[0];
+                leave_trap_srcloc(builder);
+                return result;
+            };
+            let Some(pte_state) = current_pte_state() else {
+                let call = helper.call(builder, &[state_ptr, address]);
+                let result = builder.inst_results(call)[0];
+                leave_trap_srcloc(builder);
+                return result;
+            };
+
+            let pointer_ty = pte_state.pointer_ty;
+            let miss_block = builder.create_block();
+            let check_base_block = builder.create_block();
+            let check_limit_block = builder.create_block();
+            let check_perm_block = builder.create_block();
+            let fastmem_block = builder.create_block();
+            let done_block = builder.create_block();
+            builder.append_block_param(done_block, types::I64);
+
+            let pte_missing = builder
+                .ins()
+                .icmp_imm(IntCC::Equal, pte_state.pte_ptr_u64, 0);
+            builder
+                .ins()
+                .brif(pte_missing, miss_block, &[], check_base_block, &[]);
+            builder.seal_block(check_base_block);
+
+            builder.switch_to_block(check_base_block);
+            let before_base =
                 builder
                     .ins()
-                    .load(types::I64, MemFlags::new(), host_addr, 0)
-            }
-        };
-        let direct_arg = [BlockArg::from(loaded)];
-        builder.ins().jump(done_block, &direct_arg);
+                    .icmp(IntCC::UnsignedLessThan, address, pte_state.guest_base);
+            builder
+                .ins()
+                .brif(before_base, miss_block, &[], check_limit_block, &[]);
+            builder.seal_block(check_limit_block);
 
-        builder.switch_to_block(miss_block);
-        let call = helper.call(builder, &[state_ptr, address]);
-        let slow = builder.inst_results(call)[0];
-        let slow_arg = [BlockArg::from(slow)];
-        builder.ins().jump(done_block, &slow_arg);
+            builder.switch_to_block(check_limit_block);
+            let offset = builder.ins().isub(address, pte_state.guest_base);
+            let page_index = builder.ins().ushr_imm(offset, GUEST_PAGE_BITS as i64);
+            let out_of_range = builder.ins().icmp(
+                IntCC::UnsignedGreaterThanOrEqual,
+                page_index,
+                pte_state.page_count,
+            );
+            builder
+                .ins()
+                .brif(out_of_range, miss_block, &[], check_perm_block, &[]);
+            builder.seal_block(check_perm_block);
 
-        builder.seal_block(done_block);
-        builder.switch_to_block(done_block);
-        let result = builder.block_params(done_block)[0];
-        leave_trap_srcloc(builder);
-        return result;
+            builder.switch_to_block(check_perm_block);
+            let pte_offset = builder.ins().ishl_imm(page_index, 3);
+            let pte_addr_u64 = builder.ins().iadd(pte_state.pte_ptr_u64, pte_offset);
+            let pte_addr = if pointer_ty == types::I64 {
+                pte_addr_u64
+            } else {
+                builder.ins().ireduce(pointer_ty, pte_addr_u64)
+            };
+            let pte = builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), pte_addr, 0);
+            let required = builder
+                .ins()
+                .iconst(types::I64, (PTE_FLAG_VALID | PTE_FLAG_READ) as i64);
+            let access_bits = builder
+                .ins()
+                .band_imm(pte, (PTE_FLAG_VALID | PTE_FLAG_READ) as i64);
+            let special = builder.ins().band_imm(pte, PTE_FLAG_SPECIAL as i64);
+            let missing_flags = builder.ins().icmp(IntCC::NotEqual, access_bits, required);
+            let has_special = builder.ins().icmp_imm(IntCC::NotEqual, special, 0);
+            let slow = builder.ins().bor(missing_flags, has_special);
+            builder
+                .ins()
+                .brif(slow, miss_block, &[], fastmem_block, &[]);
+            builder.seal_block(fastmem_block);
+            builder.seal_block(miss_block);
+
+            builder.switch_to_block(fastmem_block);
+            let host_page = builder.ins().band_imm(pte, !(GUEST_PAGE_MASK as i64));
+            let host_addr_u64 = builder.ins().iadd(host_page, address);
+            let host_addr = if pointer_ty == types::I64 {
+                host_addr_u64
+            } else {
+                builder.ins().ireduce(pointer_ty, host_addr_u64)
+            };
+            let loaded = match width {
+                FastmemAccessWidth::U8 => {
+                    let raw = builder.ins().load(types::I8, MemFlags::new(), host_addr, 0);
+                    builder.ins().uextend(types::I64, raw)
+                }
+                FastmemAccessWidth::U16 => {
+                    let raw = builder
+                        .ins()
+                        .load(types::I16, MemFlags::new(), host_addr, 0);
+                    builder.ins().uextend(types::I64, raw)
+                }
+                FastmemAccessWidth::U32 => {
+                    let raw = builder
+                        .ins()
+                        .load(types::I32, MemFlags::new(), host_addr, 0);
+                    builder.ins().uextend(types::I64, raw)
+                }
+                FastmemAccessWidth::U64 => {
+                    builder
+                        .ins()
+                        .load(types::I64, MemFlags::new(), host_addr, 0)
+                }
+            };
+            builder.ins().jump(done_block, &[BlockArg::from(loaded)]);
+
+            builder.switch_to_block(miss_block);
+            emit_memory_slowpath_return(builder, state_ptr, EXIT_MEMORY_FAULT);
+
+            builder.seal_block(done_block);
+            builder.switch_to_block(done_block);
+            let result = builder.block_params(done_block)[0];
+            leave_trap_srcloc(builder);
+            result
+        }
+        _ => {
+            let call = helper.call(builder, &[state_ptr, address]);
+            let result = builder.inst_results(call)[0];
+            leave_trap_srcloc(builder);
+            result
+        }
     }
-
-    let miss_block = builder.create_block();
-    let check_base_block = builder.create_block();
-    let check_wrap_block = builder.create_block();
-    let check_limit_block = builder.create_block();
-    let fastmem_block = builder.create_block();
-    let done_block = builder.create_block();
-    builder.append_block_param(done_block, types::I64);
-
-    let host_ptr_missing = builder.ins().icmp_imm(IntCC::Equal, host_ptr_u64, 0);
-    builder
-        .ins()
-        .brif(host_ptr_missing, miss_block, &[], check_base_block, &[]);
-    builder.seal_block(check_base_block);
-
-    builder.switch_to_block(check_base_block);
-    let before_base = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThan, address, guest_base);
-    builder
-        .ins()
-        .brif(before_base, miss_block, &[], check_wrap_block, &[]);
-    builder.seal_block(check_wrap_block);
-
-    builder.switch_to_block(check_wrap_block);
-    let offset = builder.ins().isub(address, guest_base);
-    let end = builder.ins().iadd_imm(offset, access_size);
-    let wrapped = builder.ins().icmp(IntCC::UnsignedLessThan, end, offset);
-    builder
-        .ins()
-        .brif(wrapped, miss_block, &[], check_limit_block, &[]);
-    builder.seal_block(check_limit_block);
-
-    builder.switch_to_block(check_limit_block);
-    let out_of_range = builder
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThan, end, region_size);
-    builder
-        .ins()
-        .brif(out_of_range, miss_block, &[], fastmem_block, &[]);
-    builder.seal_block(fastmem_block);
-    builder.seal_block(miss_block);
-
-    builder.switch_to_block(fastmem_block);
-    let host_addr_u64 = builder.ins().iadd(host_ptr_u64, offset);
-    let host_addr = if pointer_ty == types::I64 {
-        host_addr_u64
-    } else {
-        builder.ins().ireduce(pointer_ty, host_addr_u64)
-    };
-    let loaded = match width {
-        FastmemAccessWidth::U8 => {
-            let raw = builder.ins().load(types::I8, MemFlags::new(), host_addr, 0);
-            builder.ins().uextend(types::I64, raw)
-        }
-        FastmemAccessWidth::U16 => {
-            let raw = builder
-                .ins()
-                .load(types::I16, MemFlags::new(), host_addr, 0);
-            builder.ins().uextend(types::I64, raw)
-        }
-        FastmemAccessWidth::U32 => {
-            let raw = builder
-                .ins()
-                .load(types::I32, MemFlags::new(), host_addr, 0);
-            builder.ins().uextend(types::I64, raw)
-        }
-        FastmemAccessWidth::U64 => builder
-            .ins()
-            .load(types::I64, MemFlags::new(), host_addr, 0),
-    };
-    let fast_arg = [BlockArg::from(loaded)];
-    builder.ins().jump(done_block, &fast_arg);
-
-    builder.switch_to_block(miss_block);
-    let call = helper.call(builder, &[state_ptr, address]);
-    let slow = builder.inst_results(call)[0];
-    let slow_arg = [BlockArg::from(slow)];
-    builder.ins().jump(done_block, &slow_arg);
-
-    builder.seal_block(done_block);
-    builder.switch_to_block(done_block);
-    let result = builder.block_params(done_block)[0];
-    leave_trap_srcloc(builder);
-    result
 }
 
 fn emit_call_mem_write(
@@ -10593,147 +10803,218 @@ fn emit_call_mem_write(
 ) {
     enter_trap_srcloc(builder);
 
-    let Some(width) = fastmem_write_width(helper) else {
-        let _ = helper.call(builder, &[state_ptr, address, value]);
-        leave_trap_srcloc(builder);
-        return;
-    };
+    match current_memory_strategy() {
+        MemoryStrategy::Fastmem => {
+            let Some(width) = fastmem_write_width(helper) else {
+                let _ = helper.call(builder, &[state_ptr, address, value]);
+                leave_trap_srcloc(builder);
+                return;
+            };
+            let Some(fastmem_state) = current_fastmem_state() else {
+                let _ = helper.call(builder, &[state_ptr, address, value]);
+                leave_trap_srcloc(builder);
+                return;
+            };
 
-    let Some(fastmem_state) = current_fastmem_state() else {
-        let _ = helper.call(builder, &[state_ptr, address, value]);
-        leave_trap_srcloc(builder);
-        return;
-    };
+            emit_memory_barrier_flush(builder, state_ptr);
 
-    let pointer_ty = fastmem_state.pointer_ty;
-    let access_size = fastmem_access_bytes(width);
-    let guest_base = fastmem_state.guest_base;
-    let region_size = fastmem_state.size;
-    let host_ptr_u64 = fastmem_state.host_ptr_u64;
+            let pointer_ty = fastmem_state.pointer_ty;
+            let access_size = fastmem_access_bytes(width);
+            let guest_base = fastmem_state.guest_base;
+            let region_size = fastmem_state.size;
+            let host_ptr_u64 = fastmem_state.host_ptr_u64;
 
-    if unsafe_direct_memory_enabled() {
-        let miss_block = builder.create_block();
-        let direct_block = builder.create_block();
-        let done_block = builder.create_block();
+            let miss_block = builder.create_block();
+            let check_base_block = builder.create_block();
+            let check_wrap_block = builder.create_block();
+            let check_limit_block = builder.create_block();
+            let fastmem_block = builder.create_block();
+            let done_block = builder.create_block();
 
-        let host_ptr_missing = builder.ins().icmp_imm(IntCC::Equal, host_ptr_u64, 0);
-        builder
-            .ins()
-            .brif(host_ptr_missing, miss_block, &[], direct_block, &[]);
-        builder.seal_block(miss_block);
-        builder.seal_block(direct_block);
+            let host_ptr_missing = builder.ins().icmp_imm(IntCC::Equal, host_ptr_u64, 0);
+            builder
+                .ins()
+                .brif(host_ptr_missing, miss_block, &[], check_base_block, &[]);
+            builder.seal_block(check_base_block);
 
-        builder.switch_to_block(direct_block);
-        let offset = builder.ins().isub(address, guest_base);
-        let host_addr_u64 = builder.ins().iadd(host_ptr_u64, offset);
-        let host_addr = if pointer_ty == types::I64 {
-            host_addr_u64
-        } else {
-            builder.ins().ireduce(pointer_ty, host_addr_u64)
-        };
-        match width {
-            FastmemAccessWidth::U8 => {
-                let value8 = builder.ins().ireduce(types::I8, value);
-                builder.ins().store(MemFlags::new(), value8, host_addr, 0);
+            builder.switch_to_block(check_base_block);
+            let before_base = builder
+                .ins()
+                .icmp(IntCC::UnsignedLessThan, address, guest_base);
+            builder
+                .ins()
+                .brif(before_base, miss_block, &[], check_wrap_block, &[]);
+            builder.seal_block(check_wrap_block);
+
+            builder.switch_to_block(check_wrap_block);
+            let offset = builder.ins().isub(address, guest_base);
+            let end = builder.ins().iadd_imm(offset, access_size);
+            let wrapped = builder.ins().icmp(IntCC::UnsignedLessThan, end, offset);
+            builder
+                .ins()
+                .brif(wrapped, miss_block, &[], check_limit_block, &[]);
+            builder.seal_block(check_limit_block);
+
+            builder.switch_to_block(check_limit_block);
+            let out_of_range = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, end, region_size);
+            builder
+                .ins()
+                .brif(out_of_range, miss_block, &[], fastmem_block, &[]);
+            builder.seal_block(fastmem_block);
+            builder.seal_block(miss_block);
+
+            builder.switch_to_block(fastmem_block);
+            let host_addr_u64 = builder.ins().iadd(host_ptr_u64, offset);
+            let host_addr = if pointer_ty == types::I64 {
+                host_addr_u64
+            } else {
+                builder.ins().ireduce(pointer_ty, host_addr_u64)
+            };
+            match width {
+                FastmemAccessWidth::U8 => {
+                    let value8 = builder.ins().ireduce(types::I8, value);
+                    builder.ins().store(MemFlags::new(), value8, host_addr, 0);
+                }
+                FastmemAccessWidth::U16 => {
+                    let value16 = builder.ins().ireduce(types::I16, value);
+                    builder.ins().store(MemFlags::new(), value16, host_addr, 0);
+                }
+                FastmemAccessWidth::U32 => {
+                    let value32 = builder.ins().ireduce(types::I32, value);
+                    builder.ins().store(MemFlags::new(), value32, host_addr, 0);
+                }
+                FastmemAccessWidth::U64 => {
+                    builder.ins().store(MemFlags::new(), value, host_addr, 0);
+                }
             }
-            FastmemAccessWidth::U16 => {
-                let value16 = builder.ins().ireduce(types::I16, value);
-                builder.ins().store(MemFlags::new(), value16, host_addr, 0);
-            }
-            FastmemAccessWidth::U32 => {
-                let value32 = builder.ins().ireduce(types::I32, value);
-                builder.ins().store(MemFlags::new(), value32, host_addr, 0);
-            }
-            FastmemAccessWidth::U64 => {
-                builder.ins().store(MemFlags::new(), value, host_addr, 0);
-            }
+            builder.ins().jump(done_block, &[]);
+
+            builder.switch_to_block(miss_block);
+            emit_memory_slowpath_return(builder, state_ptr, EXIT_MEMORY_FAULT);
+
+            builder.seal_block(done_block);
+            builder.switch_to_block(done_block);
+            leave_trap_srcloc(builder);
         }
-        builder.ins().jump(done_block, &[]);
+        MemoryStrategy::PteChecked => {
+            let Some(width) = fastmem_write_width(helper) else {
+                let _ = helper.call(builder, &[state_ptr, address, value]);
+                leave_trap_srcloc(builder);
+                return;
+            };
+            let Some(pte_state) = current_pte_state() else {
+                let _ = helper.call(builder, &[state_ptr, address, value]);
+                leave_trap_srcloc(builder);
+                return;
+            };
 
-        builder.switch_to_block(miss_block);
-        let _ = helper.call(builder, &[state_ptr, address, value]);
-        builder.ins().jump(done_block, &[]);
+            let pointer_ty = pte_state.pointer_ty;
+            let miss_block = builder.create_block();
+            let check_base_block = builder.create_block();
+            let check_limit_block = builder.create_block();
+            let check_perm_block = builder.create_block();
+            let fastmem_block = builder.create_block();
+            let done_block = builder.create_block();
 
-        builder.seal_block(done_block);
-        builder.switch_to_block(done_block);
-        leave_trap_srcloc(builder);
-        return;
+            let pte_missing = builder
+                .ins()
+                .icmp_imm(IntCC::Equal, pte_state.pte_ptr_u64, 0);
+            builder
+                .ins()
+                .brif(pte_missing, miss_block, &[], check_base_block, &[]);
+            builder.seal_block(check_base_block);
+
+            builder.switch_to_block(check_base_block);
+            let before_base =
+                builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThan, address, pte_state.guest_base);
+            builder
+                .ins()
+                .brif(before_base, miss_block, &[], check_limit_block, &[]);
+            builder.seal_block(check_limit_block);
+
+            builder.switch_to_block(check_limit_block);
+            let offset = builder.ins().isub(address, pte_state.guest_base);
+            let page_index = builder.ins().ushr_imm(offset, GUEST_PAGE_BITS as i64);
+            let out_of_range = builder.ins().icmp(
+                IntCC::UnsignedGreaterThanOrEqual,
+                page_index,
+                pte_state.page_count,
+            );
+            builder
+                .ins()
+                .brif(out_of_range, miss_block, &[], check_perm_block, &[]);
+            builder.seal_block(check_perm_block);
+
+            builder.switch_to_block(check_perm_block);
+            let pte_offset = builder.ins().ishl_imm(page_index, 3);
+            let pte_addr_u64 = builder.ins().iadd(pte_state.pte_ptr_u64, pte_offset);
+            let pte_addr = if pointer_ty == types::I64 {
+                pte_addr_u64
+            } else {
+                builder.ins().ireduce(pointer_ty, pte_addr_u64)
+            };
+            let pte = builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), pte_addr, 0);
+            let required = builder
+                .ins()
+                .iconst(types::I64, (PTE_FLAG_VALID | PTE_FLAG_WRITE) as i64);
+            let access_bits = builder
+                .ins()
+                .band_imm(pte, (PTE_FLAG_VALID | PTE_FLAG_WRITE) as i64);
+            let special = builder.ins().band_imm(pte, PTE_FLAG_SPECIAL as i64);
+            let missing_flags = builder.ins().icmp(IntCC::NotEqual, access_bits, required);
+            let has_special = builder.ins().icmp_imm(IntCC::NotEqual, special, 0);
+            let slow = builder.ins().bor(missing_flags, has_special);
+            builder
+                .ins()
+                .brif(slow, miss_block, &[], fastmem_block, &[]);
+            builder.seal_block(fastmem_block);
+            builder.seal_block(miss_block);
+
+            builder.switch_to_block(fastmem_block);
+            let host_page = builder.ins().band_imm(pte, !(GUEST_PAGE_MASK as i64));
+            let host_addr_u64 = builder.ins().iadd(host_page, address);
+            let host_addr = if pointer_ty == types::I64 {
+                host_addr_u64
+            } else {
+                builder.ins().ireduce(pointer_ty, host_addr_u64)
+            };
+            match width {
+                FastmemAccessWidth::U8 => {
+                    let value8 = builder.ins().ireduce(types::I8, value);
+                    builder.ins().store(MemFlags::new(), value8, host_addr, 0);
+                }
+                FastmemAccessWidth::U16 => {
+                    let value16 = builder.ins().ireduce(types::I16, value);
+                    builder.ins().store(MemFlags::new(), value16, host_addr, 0);
+                }
+                FastmemAccessWidth::U32 => {
+                    let value32 = builder.ins().ireduce(types::I32, value);
+                    builder.ins().store(MemFlags::new(), value32, host_addr, 0);
+                }
+                FastmemAccessWidth::U64 => {
+                    builder.ins().store(MemFlags::new(), value, host_addr, 0);
+                }
+            }
+            builder.ins().jump(done_block, &[]);
+
+            builder.switch_to_block(miss_block);
+            emit_memory_slowpath_return(builder, state_ptr, EXIT_MEMORY_FAULT);
+
+            builder.seal_block(done_block);
+            builder.switch_to_block(done_block);
+            leave_trap_srcloc(builder);
+        }
+        _ => {
+            let _ = helper.call(builder, &[state_ptr, address, value]);
+            leave_trap_srcloc(builder);
+        }
     }
-
-    let miss_block = builder.create_block();
-    let check_base_block = builder.create_block();
-    let check_wrap_block = builder.create_block();
-    let check_limit_block = builder.create_block();
-    let fastmem_block = builder.create_block();
-    let done_block = builder.create_block();
-
-    let host_ptr_missing = builder.ins().icmp_imm(IntCC::Equal, host_ptr_u64, 0);
-    builder
-        .ins()
-        .brif(host_ptr_missing, miss_block, &[], check_base_block, &[]);
-    builder.seal_block(check_base_block);
-
-    builder.switch_to_block(check_base_block);
-    let before_base = builder
-        .ins()
-        .icmp(IntCC::UnsignedLessThan, address, guest_base);
-    builder
-        .ins()
-        .brif(before_base, miss_block, &[], check_wrap_block, &[]);
-    builder.seal_block(check_wrap_block);
-
-    builder.switch_to_block(check_wrap_block);
-    let offset = builder.ins().isub(address, guest_base);
-    let end = builder.ins().iadd_imm(offset, access_size);
-    let wrapped = builder.ins().icmp(IntCC::UnsignedLessThan, end, offset);
-    builder
-        .ins()
-        .brif(wrapped, miss_block, &[], check_limit_block, &[]);
-    builder.seal_block(check_limit_block);
-
-    builder.switch_to_block(check_limit_block);
-    let out_of_range = builder
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThan, end, region_size);
-    builder
-        .ins()
-        .brif(out_of_range, miss_block, &[], fastmem_block, &[]);
-    builder.seal_block(fastmem_block);
-    builder.seal_block(miss_block);
-
-    builder.switch_to_block(fastmem_block);
-    let host_addr_u64 = builder.ins().iadd(host_ptr_u64, offset);
-    let host_addr = if pointer_ty == types::I64 {
-        host_addr_u64
-    } else {
-        builder.ins().ireduce(pointer_ty, host_addr_u64)
-    };
-    match width {
-        FastmemAccessWidth::U8 => {
-            let value8 = builder.ins().ireduce(types::I8, value);
-            builder.ins().store(MemFlags::new(), value8, host_addr, 0);
-        }
-        FastmemAccessWidth::U16 => {
-            let value16 = builder.ins().ireduce(types::I16, value);
-            builder.ins().store(MemFlags::new(), value16, host_addr, 0);
-        }
-        FastmemAccessWidth::U32 => {
-            let value32 = builder.ins().ireduce(types::I32, value);
-            builder.ins().store(MemFlags::new(), value32, host_addr, 0);
-        }
-        FastmemAccessWidth::U64 => {
-            builder.ins().store(MemFlags::new(), value, host_addr, 0);
-        }
-    }
-    builder.ins().jump(done_block, &[]);
-
-    builder.switch_to_block(miss_block);
-    let _ = helper.call(builder, &[state_ptr, address, value]);
-    builder.ins().jump(done_block, &[]);
-
-    builder.seal_block(done_block);
-    builder.switch_to_block(done_block);
-    leave_trap_srcloc(builder);
 }
 
 fn eager_target_entry_for_pc(
@@ -11896,9 +12177,9 @@ fn emit_exit_with_imm(
 #[cfg(test)]
 mod tests {
     use super::{
+        parse_return_link_entry_count_override, required_nzcv_mask, try_fuse_mov_wide_sequence,
         BranchCondition, DecodedInstruction, FusedMovWide, NZCV_MASK_C, NZCV_MASK_N, NZCV_MASK_V,
-        NZCV_MASK_Z, parse_return_link_entry_count_override, required_nzcv_mask,
-        try_fuse_mov_wide_sequence,
+        NZCV_MASK_Z,
     };
 
     #[test]
